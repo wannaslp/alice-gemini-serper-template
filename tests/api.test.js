@@ -71,6 +71,7 @@ test("question uses OpenAI Responses schema and raw REST output extraction", asy
   assert.equal(body.max_output_tokens, 1200);
   assert.equal(body.text.verbosity, "low");
   assert.equal(body.store, true);
+  assert.equal(body.background, true);
   assert.match(body.instructions, /по-русски/);
   assert.deepEqual(body.input, [{ role: "user", content: "Почему небо голубое?" }]);
   assert.equal(body.contents, undefined);
@@ -372,4 +373,211 @@ test("long voice response is cut at a natural sentence boundary", () => {
   assert.ok(text.length <= 1024);
   assert.ok(text.endsWith("."));
   assert.equal(aliceResponse(text).response.text, text);
+});
+
+test("queued background generation stores the job without replacing successful context", async t => {
+  setup(t);
+  let payload;
+  t.mock.method(globalThis, "fetch", async (url, opts) => {
+    assert.equal(url, OPENAI);
+    payload = JSON.parse(opts.body);
+    return json({ id: "resp_job", status: "queued" });
+  });
+  const state = { history: [{ role: "user", text: "Меня зовут Ди" }], response_id: "resp_success" };
+  const out = await invoke(question("Объясни, почему небо голубое", state));
+  valid(out);
+  assert.equal(payload.background, true);
+  assert.equal(out.body.session_state.pending_response_id, "resp_job");
+  assert.equal(out.body.session_state.pending_question, "Объясни, почему небо голубое");
+  assert.equal(out.body.session_state.response_id, "resp_success");
+  assert.deepEqual(out.body.session_state.history, state.history);
+  assert.match(out.body.response.text, /готово/i);
+});
+
+test("ready and continue commands poll the pending response by GET without generating twice", async t => {
+  setup(t);
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (url, opts) => {
+    calls.push({ url, opts });
+    return json({ id: "resp_job", status: calls.length === 1 ? "queued" : "in_progress" });
+  });
+  const state = { history: [], response_id: "resp_success", pending_response_id: "resp_job", pending_question: "Почему небо голубое?" };
+  const first = await invoke(question("Готово?", state));
+  const second = await invoke(question("Дальше", first.body.session_state));
+  valid(first);
+  valid(second);
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal(call.url, OPENAI + "/resp_job");
+    assert.equal(call.opts.method, "GET");
+    assert.equal(call.opts.headers.Authorization, "Bearer test-openai-key");
+    assert.equal(call.opts.body, undefined);
+  }
+  assert.equal(second.body.session_state.pending_response_id, "resp_job");
+  assert.equal(second.body.session_state.response_id, "resp_success");
+  assert.equal(second.body.session_state.pending_question, state.pending_question);
+});
+
+test("completed pending response commits the original question and answer once", async t => {
+  setup(t);
+  const mock = t.mock.method(globalThis, "fetch", async (url, opts) => {
+    assert.equal(url, OPENAI + "/resp_job");
+    assert.equal(opts.method, "GET");
+    return json(answer("Небо голубое из-за рассеяния света.", "resp_job"));
+  });
+  const out = await invoke(question("Готово?", {
+    history: [], response_id: "resp_success", pending_response_id: "resp_job", pending_question: "Почему небо голубое?"
+  }));
+  valid(out);
+  assert.equal(out.body.response.text, "Небо голубое из-за рассеяния света.");
+  assert.equal(out.body.session_state.response_id, "resp_job");
+  assert.equal(out.body.session_state.pending_response_id, undefined);
+  assert.equal(out.body.session_state.pending_question, undefined);
+  assert.deepEqual(out.body.session_state.history, [
+    { role: "user", text: "Почему небо голубое?" },
+    { role: "assistant", text: "Небо голубое из-за рассеяния света." }
+  ]);
+  assert.equal(mock.mock.callCount(), 1);
+});
+
+test("terminal pending failures clear the job and keep the last successful context", async t => {
+  setup(t);
+  const cases = [
+    [200, { id: "resp_job", status: "failed", error: { code: "server_error" } }],
+    [200, { id: "resp_job", status: "cancelled" }],
+    [200, { id: "resp_job", status: "incomplete", incomplete_details: { reason: "max_output_tokens" }, output: [] }],
+    [404, { error: { code: "response_not_found" } }]
+  ];
+  let current;
+  t.mock.method(globalThis, "fetch", async () => json(current[1], current[0]));
+  for (current of cases) {
+    const state = { history: [{ role: "user", text: "Меня зовут Ди" }], response_id: "resp_success",
+      pending_response_id: "resp_job", pending_question: "Новый вопрос" };
+    const out = await invoke(question("Готово?", state));
+    valid(out);
+    assert.equal(out.body.session_state.pending_response_id, undefined, JSON.stringify(current));
+    assert.equal(out.body.session_state.pending_question, undefined);
+    assert.equal(out.body.session_state.response_id, "resp_success");
+    assert.deepEqual(out.body.session_state.history, state.history);
+  }
+});
+
+test("temporary pending retrieval failures retain the job for another ready command", async t => {
+  setup(t);
+  for (const mode of ["abort", 429, 500]) {
+    const mock = t.mock.method(globalThis, "fetch", async () => {
+      if (mode === "abort") throw new DOMException("Aborted", "AbortError");
+      return json({ error: { code: mode === 429 ? "rate_limit_exceeded" : "server_error" } }, mode);
+    });
+    const state = { history: [], response_id: "resp_success", pending_response_id: "resp_job", pending_question: "Почему небо голубое?" };
+    const out = await invoke(question("Готово?", state));
+    valid(out);
+    assert.deepEqual(out.body.session_state, state);
+    mock.mock.restore();
+  }
+});
+
+test("another question while pending instructs ready or cancel without provider calls", async t => {
+  setup(t);
+  const mock = t.mock.method(globalThis, "fetch", async () => assert.fail("Do not create a second pending job"));
+  const state = { history: [], response_id: "resp_success", pending_response_id: "resp_job", pending_question: "Первый вопрос" };
+  const out = await invoke(question("Расскажи другую историю", state));
+  valid(out);
+  assert.deepEqual(out.body.session_state, state);
+  assert.match(out.body.response.text, /готово/i);
+  assert.match(out.body.response.text, /отмена/i);
+  assert.equal(mock.mock.callCount(), 0);
+});
+
+test("cancel uses the background cancel endpoint and clears the job on success or not found", async t => {
+  setup(t);
+  let status = 200;
+  const mock = t.mock.method(globalThis, "fetch", async (url, opts) => {
+    assert.equal(url, OPENAI + "/resp_job/cancel");
+    assert.equal(opts.method, "POST");
+    assert.equal(opts.headers.Authorization, "Bearer test-openai-key");
+    return json(status === 200 ? { id: "resp_job", status: "cancelled" } : { error: { code: "response_not_found" } }, status);
+  });
+  for (status of [200, 404]) {
+    const out = await invoke(question("Отмена", { history: [], response_id: "resp_success",
+      pending_response_id: "resp_job", pending_question: "Первый вопрос" }));
+    valid(out);
+    assert.equal(out.body.session_state.response_id, "resp_success");
+    assert.equal(out.body.session_state.pending_response_id, undefined);
+    assert.equal(out.body.session_state.pending_question, undefined);
+  }
+  assert.equal(mock.mock.callCount(), 2);
+});
+
+test("temporary cancellation failure keeps the job available for retry", async t => {
+  setup(t);
+  t.mock.method(globalThis, "fetch", async () => json({ error: { code: "server_error" } }, 500));
+  const state = { history: [], response_id: "resp_success", pending_response_id: "resp_job", pending_question: "Первый вопрос" };
+  const out = await invoke(question("Отмена", state));
+  valid(out);
+  assert.deepEqual(out.body.session_state, state);
+});
+
+test("a new session drops a pending job and starts the new question normally", async t => {
+  setup(t);
+  const mock = t.mock.method(globalThis, "fetch", async (url, opts) => {
+    assert.equal(url, OPENAI);
+    assert.equal(opts.method, "POST");
+    const payload = JSON.parse(opts.body);
+    assert.equal(payload.previous_response_id, undefined);
+    assert.deepEqual(payload.input, [{ role: "user", content: "Новый вопрос" }]);
+    return json(answer("Новый ответ.", "resp_new"));
+  });
+  const out = await invoke(question("Новый вопрос", { history: [{ role: "user", text: "Старая сессия" }],
+    response_id: "resp_success", pending_response_id: "resp_oldjob", pending_question: "Старый вопрос"
+  }, { session: { new: true } }));
+  valid(out);
+  assert.equal(out.body.response.text, "Новый ответ.");
+  assert.equal(out.body.session_state.pending_response_id, undefined);
+  assert.equal(out.body.session_state.response_id, "resp_new");
+  assert.equal(mock.mock.callCount(), 1);
+});
+
+test("ready without a pending response does not create a new generation", async t => {
+  setup(t);
+  const mock = t.mock.method(globalThis, "fetch", async () => assert.fail("No pending response to retrieve"));
+  const state = { history: [], response_id: "resp_success" };
+  const out = await invoke(question("Готово?", state));
+  valid(out);
+  assert.deepEqual(out.body.session_state, state);
+  assert.equal(mock.mock.callCount(), 0);
+});
+
+test("pending Unicode question and two response IDs still fit the complete 1 KiB state", async t => {
+  setup(t);
+  const pendingId = "resp_" + "j".repeat(180);
+  const oldId = "resp_" + "s".repeat(180);
+  const long = ('Объясни свойства света 🐈‍⬛ 🎉 "цитата"\\\n').repeat(100);
+  t.mock.method(globalThis, "fetch", async () => json({ id: pendingId, status: "in_progress" }));
+  const out = await invoke(question(long, { response_id: oldId,
+    history: Array.from({ length: 8 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", text: long })) }));
+  valid(out);
+  assert.equal(out.body.session_state.response_id, oldId);
+  assert.equal(out.body.session_state.pending_response_id, pendingId);
+  assert.ok(out.body.session_state.pending_question.length > 0);
+  assert.equal(JSON.stringify(out.body.session_state).includes("\\ud83d"), false);
+});
+
+test("normal continuation words go to the model when no job is pending", async t => {
+  setup(t);
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (url, opts) => {
+    assert.equal(url, OPENAI);
+    assert.equal(opts.method, "POST");
+    calls.push(JSON.parse(opts.body));
+    return json(answer("Продолжаю историю.", "resp_continued"));
+  });
+  for (const command of ["Да", "Дальше", "Продолжай"]) {
+    const out = await invoke(question(command, { history: [], response_id: "resp_story" }));
+    valid(out);
+    assert.equal(out.body.response.text, "Продолжаю историю.");
+    assert.equal(calls.at(-1).previous_response_id, "resp_story");
+    assert.equal(calls.at(-1).input.at(-1).content, command);
+  }
+  assert.equal(calls.length, 3);
 });

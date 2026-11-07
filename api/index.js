@@ -3,7 +3,7 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_SESSION_BYTES = 1024;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 4000;
 const RESPONSE_RESERVE_MS = 150;
 const SERPER_TIMEOUT_MS = 600;
 const MIN_OPENAI_BUDGET_MS = 250;
@@ -44,15 +44,25 @@ function safeResponseId(value) {
   return typeof value === "string" && /^resp_[A-Za-z0-9_-]{1,200}$/.test(value) ? value : undefined;
 }
 
-function sessionState(history, responseId) {
+function sessionState(history, responseId, pending = {}) {
   const state = { history: safeHistory(history) };
   const id = safeResponseId(responseId);
   if (id) state.response_id = id;
+  const pendingId = safeResponseId(pending.id);
+  if (pendingId) {
+    state.pending_response_id = pendingId;
+    state.pending_question = Array.from(String(pending.question || "")).slice(0, 200).join("");
+  }
   // Yandex limits the complete JSON state to 1 KiB, including UTF-8 and escaping.
   const size = () => Buffer.byteLength(JSON.stringify(state), "utf8");
   while (size() > MAX_SESSION_BYTES && state.history.length > 2) state.history.shift();
-  while (size() > MAX_SESSION_BYTES && state.history.length) {
-    const longest = state.history.reduce((a, b) => a.text.length >= b.text.length ? a : b);
+  while (size() > MAX_SESSION_BYTES) {
+    const longest = state.history.reduce((a, b) => a.text.length >= b.text.length ? a : b, { text: "" });
+    if ((state.pending_question?.length || 0) > longest.text.length) {
+      const chars = Array.from(state.pending_question);
+      state.pending_question = chars.slice(0, Math.floor(chars.length * 0.75)).join("");
+      continue;
+    }
     const chars = Array.from(longest.text);
     if (chars.length <= 16) state.history.shift();
     else longest.text = chars.slice(0, Math.floor(chars.length * 0.75)).join("");
@@ -60,12 +70,26 @@ function sessionState(history, responseId) {
   return state;
 }
 
-function aliceResponse(text, endSession = false, history = [], responseId) {
+function aliceResponse(text, endSession = false, history = [], responseId, pending) {
   return {
     version: "1.0",
     response: { text: fitAliceText(text), end_session: endSession },
-    session_state: sessionState(history, responseId)
+    session_state: sessionState(history, responseId, pending)
   };
+}
+
+function pendingResponse(state, text = "Готовлю ответ. Через несколько секунд скажи «Готово?» или «Дальше», и я проверю результат.") {
+  return aliceResponse(text, false, state.history, state.response_id, {
+    id: state.pending_response_id, question: state.pending_question
+  });
+}
+
+function isPollCommand(text) {
+  return /^(готово|готова|уже готово|ответ готов|проверить|проверь|дальше|продолжай|продолжить|да)[?!.\s]*$/i.test(text);
+}
+
+function isCancelCommand(text) {
+  return /^(отмена|отмени|отменить|отмени запрос|отмени вопрос)[?!.\s]*$/i.test(text);
 }
 
 function isSearchIntent(text) {
@@ -182,6 +206,8 @@ async function askOpenAI(text, state, searchContext, needsSearch, remainingMs, c
       reasoning: { effort: config.effort },
       text: { verbosity: "low" },
       max_output_tokens: config.maxOutputTokens,
+      // Return an ID promptly; OpenAI continues generation after this HTTP call ends.
+      background: true,
       store: true
     };
     if (previousId) payload.previous_response_id = previousId;
@@ -201,6 +227,16 @@ async function askOpenAI(text, state, searchContext, needsSearch, remainingMs, c
   }
   const { response, data } = result;
   if (!response.ok) throw openAIError(response, data);
+  return readOpenAIResponse(data);
+}
+
+function readOpenAIResponse(data) {
+  if (["queued", "in_progress"].includes(data?.status)) {
+    const pendingId = safeResponseId(data.id);
+    if (!pendingId) throw new Error("OPENAI_EMPTY_RESPONSE");
+    return { pendingId };
+  }
+  if (data?.status === "cancelled") throw new Error("OPENAI_CANCELLED");
   if (data?.error || data?.status === "failed") throw new Error("OPENAI_REQUEST_FAILED");
   const messages = (Array.isArray(data?.output) ? data.output : []).filter(item => item?.type === "message" && item.role === "assistant");
   const content = messages.flatMap(item => Array.isArray(item.content) ? item.content : []);
@@ -211,6 +247,41 @@ async function askOpenAI(text, state, searchContext, needsSearch, remainingMs, c
   }
   if (!answer) throw new Error("OPENAI_EMPTY_RESPONSE");
   return { answer: fitAliceText(answer), responseId: safeResponseId(data.id) };
+}
+
+async function handlePending(state, text, remainingMs, config) {
+  if (text && !isPollCommand(text) && !isCancelCommand(text)) {
+    return pendingResponse(state, "Я еще готовлю ответ на предыдущий вопрос. Скажи «Готово?», чтобы получить его, или «Отмена», чтобы задать новый вопрос.");
+  }
+  const cancel = isCancelCommand(text);
+  const url = `${OPENAI_URL}/${state.pending_response_id}${cancel ? "/cancel" : ""}`;
+  let result;
+  try {
+    result = await fetchJson(url, {
+      method: cancel ? "POST" : "GET",
+      headers: { Authorization: `Bearer ${config.key}` }
+    }, Math.max(0, remainingMs() - RESPONSE_RESERVE_MS));
+  } catch {
+    // A retrieval timeout must not discard a generation already accepted by OpenAI.
+    return pendingResponse(state, "Не удалось проверить ответ прямо сейчас. Скажи «Готово?» еще раз через несколько секунд.");
+  }
+  const { response, data } = result;
+  if (response.status === 404) {
+    return aliceResponse("Не удалось найти подготовленный ответ. Задай вопрос еще раз.", false, state.history, state.response_id);
+  }
+  if (!response.ok) return pendingResponse(state, errorForUser(openAIError(response, data)));
+  if (cancel) return aliceResponse("Запрос отменен. Что хочешь узнать?", false, state.history, state.response_id);
+  try {
+    const answer = readOpenAIResponse(data);
+    if (answer.pendingId) return pendingResponse(state);
+    const history = [...state.history];
+    if (state.pending_question) history.push({ role: "user", text: state.pending_question });
+    history.push({ role: "assistant", text: answer.answer });
+    return aliceResponse(answer.answer, false, history, answer.responseId || state.pending_response_id);
+  } catch (error) {
+    // Terminal failures clear the pending job, retaining the last successful conversation.
+    return aliceResponse(errorForUser(error), false, state.history, state.response_id);
+  }
 }
 
 function errorForUser(error) {
@@ -234,6 +305,8 @@ function errorForUser(error) {
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "OPENAI_OUTPUT_LIMIT":
       return "Не удалось закончить ответ в пределах лимита. Попробуйте задать более простой вопрос.";
+    case "OPENAI_CANCELLED":
+      return "Подготовка ответа была отменена. Задай новый вопрос.";
     case "TIME_BUDGET_EXHAUSTED":
       return "Не успела подготовить ответ. Попробуйте задать вопрос еще раз, чуть короче.";
     default:
@@ -264,7 +337,23 @@ export default async function handler(req, res) {
   const command = body?.request?.command;
   // An explicitly empty command is a launch; original_utterance contains the activation phrase.
   const text = String(typeof command === "string" ? command : body?.request?.original_utterance || "").trim().slice(0, 4000);
-  const oldState = body?.session?.new === true ? sessionState([]) : sessionState(body?.state?.session?.history, body?.state?.session?.response_id);
+  const oldState = body?.session?.new === true ? sessionState([]) : sessionState(
+    body?.state?.session?.history, body?.state?.session?.response_id,
+    { id: body?.state?.session?.pending_response_id, question: body?.state?.session?.pending_question }
+  );
+
+  if (oldState.pending_response_id) {
+    try {
+      return res.status(200).json(await handlePending(oldState, text, remainingMs, openAIConfig()));
+    } catch (error) {
+      return res.status(200).json(pendingResponse(oldState, errorForUser(error)));
+    }
+  }
+
+  // Outside a pending job, «да», «дальше» and «продолжай» are normal dialogue.
+  if (/^(готово|готова|уже готово|ответ готов)[?!.\s]*$/i.test(text) || isCancelCommand(text)) {
+    return res.status(200).json(aliceResponse("Сейчас нет вопроса, ожидающего ответа. Что хочешь узнать?", false, oldState.history, oldState.response_id));
+  }
 
   if (!text) {
     return res.status(200).json(aliceResponse(
@@ -278,7 +367,12 @@ export default async function handler(req, res) {
     const searchFollowUp = previousQuestion && isSearchIntent(previousQuestion) && /^(а\s+)?(в\s|на\s|там\b|тогда\b)/i.test(text);
     const needsSearch = isSearchIntent(text) || Boolean(searchFollowUp);
     const searchContext = needsSearch ? await searchWeb(searchQuery(text, oldState.history), Math.min(SERPER_TIMEOUT_MS, remainingMs() - MIN_OPENAI_BUDGET_MS - RESPONSE_RESERVE_MS)) : "";
-    const { answer, responseId } = await askOpenAI(text, oldState, searchContext, needsSearch, remainingMs, config);
+    const result = await askOpenAI(text, oldState, searchContext, needsSearch, remainingMs, config);
+    if (result.pendingId) {
+      const waiting = sessionState(oldState.history, oldState.response_id, { id: result.pendingId, question: text });
+      return res.status(200).json(pendingResponse(waiting));
+    }
+    const { answer, responseId } = result;
     const history = [...oldState.history, { role: "user", text }, { role: "assistant", text: answer }];
     return res.status(200).json(aliceResponse(answer, false, history, responseId));
   } catch (error) {

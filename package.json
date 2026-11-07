@@ -1,6 +1,6 @@
 {
   "name": "alice-openai-serper",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "Вебхук Яндекс Алисы на Vercel: OpenAI GPT-6.1 Sol, контекст разговора и поиск Serper",
